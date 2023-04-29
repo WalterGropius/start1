@@ -7,7 +7,7 @@ import { Color } from 'three'
 extend({ LUTPass })
 
 function Grading() {
-  const { texture3D } = useLoader(LUTCubeLoader, '/cubicle-99.CUBE')
+  const { texture3D } = useLoader(LUTCubeLoader, '/start1/cubicle-99.CUBE')
   return (
     <Effects>
       <lUTPass lut={texture3D} intensity={0.75} />
@@ -16,7 +16,7 @@ function Grading() {
 }
 
 function Sphere({ setShowText, ...props }) {
-  const texture = useTexture('/terrazo.png')
+  const texture = useTexture('/start1/terrazo.png')
   const [scale, setScale] = useState(1)
 
   const handleClick = () => {
@@ -51,7 +51,7 @@ export default function App() {
   useEffect(() => {
     async function loadFont() {
       try {
-        const font = new FontFace('Poppins-Black', "url('/Poppins-Black.woff')")
+        const font = new FontFace('Poppins', "url('/start1/Poppins-Black.woff ')")
         await font.load()
         document.fonts.add(font)
         setFontLoaded(true)
@@ -83,7 +83,7 @@ export default function App() {
             transform: 'translate(-50%, -50%)',
             fontSize: '3rem',
             fontWeight: 'bold',
-            fontFamily: 'Poppins-Black',
+            fontFamily: 'Poppins',
             pointerEvents: 'none',
           }}>
           V S T U P T E

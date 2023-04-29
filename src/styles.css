@@ -25,8 +25,7 @@ div {
 }
 
 @font-face {
-  font-family: 'Poppins-Black';
-  src: url('/Poppins-Black.woff') format('woff');
+  font-family: 'Poppins'; 
   font-weight: normal;
   font-style: normal;
 }
