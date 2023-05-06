@@ -20,7 +20,7 @@ function Sphere({ setShowText, ...props }) {
   const [scale, setScale] = useState(1)
 
   const handleClick = () => {
-    window.open('https://lllzom.csb.app/', 'noopener noreferrer')
+    window.open('https://zenbau.haus/about1', 'noopener noreferrer')
   }
 
   return (
