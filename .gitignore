@@ -1,1 +1,5 @@
-node_modules
+.toolchain/
+build/
+.zcc/
+.zero/
+*.o

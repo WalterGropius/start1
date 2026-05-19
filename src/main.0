@@ -1,0 +1,758 @@
+// zcc - a model-agnostic coding agent CLI, written in Zero.
+//
+// Usage:
+//   zcc "task instruction" workspace-file [workspace-file ...]
+//   zcc -f taskfile.txt    workspace-file [workspace-file ...]
+//
+// Environment configuration:
+//   ZCC_API         "anthropic" (default) | "openai"
+//                    ("openai" = any OpenAI-compatible Chat Completions
+//                     endpoint: OpenAI, OpenRouter, Groq, DeepSeek,
+//                     Mistral, Together, vLLM, llama.cpp, Ollama, ...)
+//   ZCC_BASE_URL    API origin (default https://api.anthropic.com
+//                    or https://api.openai.com)
+//   ZCC_MODEL       model id (required)
+//   ZCC_KEY         API key (or ANTHROPIC_API_KEY / OPENAI_API_KEY)
+//   ZCC_MAX_TOKENS  max output tokens (default 4096)
+//
+// The agent is given the contents of every workspace file, performs the
+// task, prints its reply, and rewrites files in place using a strict
+// line protocol it is taught in the system prompt:
+//
+//   @@WRITE <path>
+//   <complete new file contents>
+//   @@END
+//
+// and finishes with: @@DONE <summary>
+//
+// The Zero direct backend only allows stdlib calls and language
+// primitives inside `main` (no user functions taking spans/strings),
+// so the whole agent is implemented as one inlined routine.
+
+pub fun main(world: World) -> Void raises {
+    let argc = std.args.len()
+    if argc < 2 {
+        check world.err.write("zcc: usage: zcc \"task\" file [file ...]  |  zcc -f taskfile file [file ...]\n")
+        return
+    }
+
+    let arg1m = std.args.get(1)
+    if arg1m.has == false {
+        check world.err.write("zcc: missing task\n")
+        return
+    }
+    let arg1 = arg1m.value
+
+    // dashF = (arg1 == "-f")
+    let a1 = std.mem.span(arg1)
+    let dfm = std.mem.span("-f")
+    let mut dashF = false
+    if std.mem.eqlBytes(a1, dfm) {
+        dashF = true
+    }
+
+    // ---- task text ----
+    let mut taskbuf: [8192]u8 = [0_u8; 8192]
+    let mut tlen: usize = 0
+    let mut firstFileArg: usize = 2
+
+    if dashF {
+        let tfm = std.args.get(2)
+        if tfm.has == false {
+            check world.err.write("zcc: -f requires a task file path\n")
+            return
+        }
+        tlen = std.fs.read(tfm.value, taskbuf)
+        firstFileArg = 3
+    } else {
+        let ts = std.mem.span(arg1)
+        let tn0 = std.mem.len(ts)
+        let mut ti: usize = 0
+        while ti < tn0 {
+            taskbuf[ti] = ts[ti]
+            ti = ti + 1
+        }
+        tlen = tn0
+        firstFileArg = 2
+    }
+
+    if argc <= firstFileArg {
+        check world.err.write("zcc: provide at least one workspace file path\n")
+        return
+    }
+
+    // ---- configuration ----
+    let mut api: String = "anthropic"
+    let apim = std.env.get("ZCC_API")
+    if apim.has {
+        api = apim.value
+    }
+    let mut isOpenai = false
+    if std.mem.eqlBytes(std.mem.span(api), std.mem.span("openai")) {
+        isOpenai = true
+    }
+
+    let mut base: String = "https://api.anthropic.com"
+    if isOpenai {
+        base = "https://api.openai.com"
+    }
+    let basem = std.env.get("ZCC_BASE_URL")
+    if basem.has {
+        base = basem.value
+    }
+
+    let mut model: String = ""
+    let modelm = std.env.get("ZCC_MODEL")
+    if modelm.has {
+        model = modelm.value
+    }
+    if std.mem.len(std.mem.span(model)) == 0 {
+        check world.err.write("zcc: set ZCC_MODEL to a model id\n")
+        return
+    }
+
+    let mut maxTok: String = "4096"
+    let mtm = std.env.get("ZCC_MAX_TOKENS")
+    if mtm.has {
+        maxTok = mtm.value
+    }
+
+    let mut key: String = ""
+    let keym = std.env.get("ZCC_KEY")
+    if keym.has {
+        key = keym.value
+    }
+    if std.mem.len(std.mem.span(key)) == 0 {
+        if isOpenai {
+            let k2 = std.env.get("OPENAI_API_KEY")
+            if k2.has {
+                key = k2.value
+            }
+        } else {
+            let k3 = std.env.get("ANTHROPIC_API_KEY")
+            if k3.has {
+                key = k3.value
+            }
+        }
+    }
+    if std.mem.len(std.mem.span(key)) == 0 {
+        check world.err.write("zcc: no API key (set ZCC_KEY or ANTHROPIC_API_KEY / OPENAI_API_KEY)\n")
+        return
+    }
+
+    // ---- build the raw system text: prompt + workspace files ----
+    let mut sysraw: [49152]u8 = [0_u8; 49152]
+    let mut sl: usize = 0
+    let scap: usize = 49152
+
+    let sp = std.mem.span("You are zcc, an autonomous software engineering agent operating over a fixed workspace. You are precise and terse and act like a senior engineer.\n\nThe workspace files are provided below, each delimited by:\n=== FILE: <path> ===\n<contents>\n=== END FILE ===\n\nComplete the task by rewriting whole files. Respond using ONLY this line protocol:\n\n1. Optional short reasoning, a few lines maximum.\n2. For every file you create or modify, emit a block EXACTLY in this form:\n@@WRITE <path>\n<the complete new file contents>\n@@END\nThe <path> MUST be byte-for-byte one of the workspace paths listed below. Do not invent new paths. Always output the ENTIRE file, never a diff. Do not wrap contents in markdown fences.\n3. Finish with one final line:\n@@DONE <one sentence summary>\n\nKeep changes minimal and correct. Never put @@WRITE or @@END as literal file content. If no change is needed, still emit @@DONE explaining why. Output nothing after @@DONE.\n\n")
+    let spn = std.mem.len(sp)
+    let mut spi: usize = 0
+    while spi < spn {
+        if sl < scap {
+            sysraw[sl] = sp[spi]
+            sl = sl + 1
+        }
+        spi = spi + 1
+    }
+
+    let mut filebuf: [32768]u8 = [0_u8; 32768]
+    let fhdr = std.mem.span("=== FILE: ")
+    let fhn = std.mem.len(fhdr)
+    let fmid = std.mem.span(" ===\n")
+    let fmn = std.mem.len(fmid)
+    let fend = std.mem.span("\n=== END FILE ===\n")
+    let fen = std.mem.len(fend)
+    let fnew = std.mem.span("(new file - does not exist yet)")
+    let fnn = std.mem.len(fnew)
+
+    let mut fi = firstFileArg
+    while fi < argc {
+        let fam = std.args.get(fi)
+        if fam.has {
+            let path = fam.value
+            let ps = std.mem.span(path)
+            let pn = std.mem.len(ps)
+
+            let mut h: usize = 0
+            while h < fhn {
+                if sl < scap {
+                    sysraw[sl] = fhdr[h]
+                    sl = sl + 1
+                }
+                h = h + 1
+            }
+            let mut pp: usize = 0
+            while pp < pn {
+                if sl < scap {
+                    sysraw[sl] = ps[pp]
+                    sl = sl + 1
+                }
+                pp = pp + 1
+            }
+            let mut m: usize = 0
+            while m < fmn {
+                if sl < scap {
+                    sysraw[sl] = fmid[m]
+                    sl = sl + 1
+                }
+                m = m + 1
+            }
+
+            if std.fs.exists(path) {
+                let fc = std.fs.read(path, filebuf)
+                let mut k: usize = 0
+                while k < fc {
+                    if sl < scap {
+                        sysraw[sl] = filebuf[k]
+                        sl = sl + 1
+                    }
+                    k = k + 1
+                }
+            } else {
+                let mut nz: usize = 0
+                while nz < fnn {
+                    if sl < scap {
+                        sysraw[sl] = fnew[nz]
+                        sl = sl + 1
+                    }
+                    nz = nz + 1
+                }
+            }
+
+            let mut ee: usize = 0
+            while ee < fen {
+                if sl < scap {
+                    sysraw[sl] = fend[ee]
+                    sl = sl + 1
+                }
+                ee = ee + 1
+            }
+        }
+        fi = fi + 1
+    }
+
+    // ---- assemble HTTP request envelope into reqbuf ----
+    let mut reqbuf: [131072]u8 = [0_u8; 131072]
+    let rcap: usize = 131072
+    let mut p: usize = 0
+
+    // helper-free raw copy is repeated inline; line + headers first
+    let l1 = std.mem.span("POST ")
+    let mut x: usize = 0
+    let l1n = std.mem.len(l1)
+    while x < l1n {
+        reqbuf[p] = l1[x]
+        p = p + 1
+        x = x + 1
+    }
+    let bs = std.mem.span(base)
+    let bn = std.mem.len(bs)
+    x = 0
+    while x < bn {
+        reqbuf[p] = bs[x]
+        p = p + 1
+        x = x + 1
+    }
+
+    let mut head: Span<u8> = std.mem.span("/v1/messages\nx-api-key: ")
+    if isOpenai {
+        head = std.mem.span("/v1/chat/completions\nauthorization: Bearer ")
+    }
+    let hn = std.mem.len(head)
+    x = 0
+    while x < hn {
+        reqbuf[p] = head[x]
+        p = p + 1
+        x = x + 1
+    }
+    let ks = std.mem.span(key)
+    let kn = std.mem.len(ks)
+    x = 0
+    while x < kn {
+        reqbuf[p] = ks[x]
+        p = p + 1
+        x = x + 1
+    }
+    let mut hdr2: Span<u8> = std.mem.span("\nanthropic-version: 2023-06-01\ncontent-type: application/json\naccept: application/json\n\n")
+    if isOpenai {
+        hdr2 = std.mem.span("\ncontent-type: application/json\naccept: application/json\n\n")
+    }
+    let h2n = std.mem.len(hdr2)
+    x = 0
+    while x < h2n {
+        reqbuf[p] = hdr2[x]
+        p = p + 1
+        x = x + 1
+    }
+
+    // JSON body opening: {"model":"MODEL","max_tokens":MAX,
+    let j1 = std.mem.span("{\"model\":\"")
+    let j1n = std.mem.len(j1)
+    x = 0
+    while x < j1n {
+        reqbuf[p] = j1[x]
+        p = p + 1
+        x = x + 1
+    }
+    let ms = std.mem.span(model)
+    let mn = std.mem.len(ms)
+    x = 0
+    while x < mn {
+        reqbuf[p] = ms[x]
+        p = p + 1
+        x = x + 1
+    }
+    let j2 = std.mem.span("\",\"max_tokens\":")
+    let j2n = std.mem.len(j2)
+    x = 0
+    while x < j2n {
+        reqbuf[p] = j2[x]
+        p = p + 1
+        x = x + 1
+    }
+    let mxs = std.mem.span(maxTok)
+    let mxn = std.mem.len(mxs)
+    x = 0
+    while x < mxn {
+        reqbuf[p] = mxs[x]
+        p = p + 1
+        x = x + 1
+    }
+
+    let mut sopen: Span<u8> = std.mem.span(",\"system\":\"")
+    if isOpenai {
+        sopen = std.mem.span(",\"messages\":[{\"role\":\"system\",\"content\":\"")
+    }
+    let son = std.mem.len(sopen)
+    x = 0
+    while x < son {
+        reqbuf[p] = sopen[x]
+        p = p + 1
+        x = x + 1
+    }
+
+    // escape-copy sysraw[0..sl] into the JSON string
+    let mut se: usize = 0
+    while se < sl {
+        let c = sysraw[se]
+        if c == 34_u8 {
+            reqbuf[p] = 92_u8
+            p = p + 1
+            reqbuf[p] = 34_u8
+            p = p + 1
+        } else {
+            if c == 92_u8 {
+                reqbuf[p] = 92_u8
+                p = p + 1
+                reqbuf[p] = 92_u8
+                p = p + 1
+            } else {
+                if c == 10_u8 {
+                    reqbuf[p] = 92_u8
+                    p = p + 1
+                    reqbuf[p] = 110_u8
+                    p = p + 1
+                } else {
+                    if c == 13_u8 {
+                        reqbuf[p] = 92_u8
+                        p = p + 1
+                        reqbuf[p] = 114_u8
+                        p = p + 1
+                    } else {
+                        if c == 9_u8 {
+                            reqbuf[p] = 92_u8
+                            p = p + 1
+                            reqbuf[p] = 116_u8
+                            p = p + 1
+                        } else {
+                            if c < 32_u8 {
+                                reqbuf[p] = 32_u8
+                                p = p + 1
+                            } else {
+                                reqbuf[p] = c
+                                p = p + 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        se = se + 1
+    }
+
+    let mut uopen: Span<u8> = std.mem.span("\",\"messages\":[{\"role\":\"user\",\"content\":\"")
+    if isOpenai {
+        uopen = std.mem.span("\"},{\"role\":\"user\",\"content\":\"")
+    }
+    let uon = std.mem.len(uopen)
+    x = 0
+    while x < uon {
+        reqbuf[p] = uopen[x]
+        p = p + 1
+        x = x + 1
+    }
+
+    // escape-copy taskbuf[0..tlen]
+    let mut te: usize = 0
+    while te < tlen {
+        let c = taskbuf[te]
+        if c == 34_u8 {
+            reqbuf[p] = 92_u8
+            p = p + 1
+            reqbuf[p] = 34_u8
+            p = p + 1
+        } else {
+            if c == 92_u8 {
+                reqbuf[p] = 92_u8
+                p = p + 1
+                reqbuf[p] = 92_u8
+                p = p + 1
+            } else {
+                if c == 10_u8 {
+                    reqbuf[p] = 92_u8
+                    p = p + 1
+                    reqbuf[p] = 110_u8
+                    p = p + 1
+                } else {
+                    if c == 13_u8 {
+                        reqbuf[p] = 92_u8
+                        p = p + 1
+                        reqbuf[p] = 114_u8
+                        p = p + 1
+                    } else {
+                        if c == 9_u8 {
+                            reqbuf[p] = 92_u8
+                            p = p + 1
+                            reqbuf[p] = 116_u8
+                            p = p + 1
+                        } else {
+                            if c < 32_u8 {
+                                reqbuf[p] = 32_u8
+                                p = p + 1
+                            } else {
+                                reqbuf[p] = c
+                                p = p + 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        te = te + 1
+    }
+
+    let jend = std.mem.span("\"}]}")
+    let jen = std.mem.len(jend)
+    x = 0
+    while x < jen {
+        reqbuf[p] = jend[x]
+        p = p + 1
+        x = x + 1
+    }
+    let _rc = rcap
+
+    let _md = std.fs.makeDir(".zcc")
+    let _wr = std.fs.writeBytes(".zcc/last-request.txt", reqbuf[0..p])
+
+    // ---- HTTP call ----
+    let net = std.net.host()
+    let client = std.http.client(net)
+    let mut response: [131072]u8 = [0_u8; 131072]
+    let reqSpan: Span<u8> = reqbuf[0..p]
+    let result = std.http.fetch(client, reqSpan, response, std.time.ms(180000))
+
+    let status = std.http.resultStatus(result)
+    let blen = std.http.resultBodyLen(result)
+    let boff = std.http.responseBodyOffset(response)
+    let body: Span<u8> = response[boff..boff + blen]
+    let _wb = std.fs.writeBytes(".zcc/last-response.txt", body)
+
+    if std.http.resultOk(result) == false {
+        check world.err.write("zcc: HTTP request failed (see .zcc/last-response.txt)\n")
+        if status == 0 {
+            let err = std.http.resultError(result)
+            if err == std.http.errorDns() {
+                check world.err.write("  dns lookup failed\n")
+            }
+            if err == std.http.errorConnect() {
+                check world.err.write("  connect failed\n")
+            }
+            if err == std.http.errorTls() {
+                check world.err.write("  TLS verification failed\n")
+            }
+            if err == std.http.errorTimeout() {
+                check world.err.write("  request timed out\n")
+            }
+            if err == std.http.errorTooLarge() {
+                check world.err.write("  response too large for buffer\n")
+            }
+        }
+        if blen > 0 {
+            check world.err.write(body)
+            check world.err.write("\n")
+        }
+        return
+    }
+
+    // ---- locate assistant text in the JSON response ----
+    let mut needle: Span<u8> = std.mem.span("\"text\":\"")
+    if isOpenai {
+        needle = std.mem.span("\"content\":\"")
+    }
+    let nn = std.mem.len(needle)
+    let hn2 = std.mem.len(body)
+    let mut found = hn2
+    if nn > 0 {
+        if nn <= hn2 {
+            let mut si: usize = 0
+            let lastI = (hn2 - nn) + 1
+            while si < lastI {
+                let mut jj: usize = 0
+                let mut ok = true
+                while jj < nn {
+                    if body[si + jj] != needle[jj] {
+                        ok = false
+                        jj = nn
+                    } else {
+                        jj = jj + 1
+                    }
+                }
+                if ok {
+                    found = si
+                    si = lastI
+                } else {
+                    si = si + 1
+                }
+            }
+        }
+    }
+    if found >= hn2 {
+        check world.err.write("zcc: could not find assistant content in response (see .zcc/last-response.txt)\n")
+        if blen > 0 {
+            check world.err.write(body)
+            check world.err.write("\n")
+        }
+        return
+    }
+
+    // ---- JSON-unescape into outbuf ----
+    let mut outbuf: [65536]u8 = [0_u8; 65536]
+    let ocap: usize = 65536
+    let mut o: usize = 0
+    let mut bi = found + nn
+    let bn2 = hn2
+    let mut goingB = true
+    while goingB {
+        if bi >= bn2 {
+            goingB = false
+        } else {
+            let c = body[bi]
+            if c == 34_u8 {
+                goingB = false
+            } else {
+                if c == 92_u8 {
+                    if bi + 1 < bn2 {
+                        let e = body[bi + 1]
+                        if e == 110_u8 {
+                            if o < ocap {
+                                outbuf[o] = 10_u8
+                                o = o + 1
+                            }
+                            bi = bi + 2
+                        } else {
+                            if e == 116_u8 {
+                                if o < ocap {
+                                    outbuf[o] = 9_u8
+                                    o = o + 1
+                                }
+                                bi = bi + 2
+                            } else {
+                                if e == 114_u8 {
+                                    if o < ocap {
+                                        outbuf[o] = 13_u8
+                                        o = o + 1
+                                    }
+                                    bi = bi + 2
+                                } else {
+                                    if e == 98_u8 {
+                                        if o < ocap {
+                                            outbuf[o] = 8_u8
+                                            o = o + 1
+                                        }
+                                        bi = bi + 2
+                                    } else {
+                                        if e == 102_u8 {
+                                            if o < ocap {
+                                                outbuf[o] = 12_u8
+                                                o = o + 1
+                                            }
+                                            bi = bi + 2
+                                        } else {
+                                            if e == 117_u8 {
+                                                if o < ocap {
+                                                    outbuf[o] = 63_u8
+                                                    o = o + 1
+                                                }
+                                                bi = bi + 6
+                                            } else {
+                                                if o < ocap {
+                                                    outbuf[o] = e
+                                                    o = o + 1
+                                                }
+                                                bi = bi + 2
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        bi = bi + 1
+                    }
+                } else {
+                    if o < ocap {
+                        outbuf[o] = c
+                        o = o + 1
+                    }
+                    bi = bi + 1
+                }
+            }
+        }
+    }
+
+    let text: Span<u8> = outbuf[0..o]
+    check world.out.write(text)
+    check world.out.write("\n")
+
+    // ---- apply @@WRITE <path> ... @@END blocks ----
+    let wmark = std.mem.span("@@WRITE ")
+    let wln = std.mem.len(wmark)
+    let emk = std.mem.span("\n@@END")
+    let eln = std.mem.len(emk)
+    let tn = o
+    let mut scan: usize = 0
+    let mut wrote: usize = 0
+
+    let mut scanning = true
+    while scanning {
+        if scan >= tn {
+            scanning = false
+        } else {
+            // find wmark from scan
+            let mut wpos = tn
+            if wln <= tn {
+                if scan + wln <= tn {
+                    let mut s2 = scan
+                    let lim = (tn - wln) + 1
+                    while s2 < lim {
+                        let mut q: usize = 0
+                        let mut ok2 = true
+                        while q < wln {
+                            if outbuf[s2 + q] != wmark[q] {
+                                ok2 = false
+                                q = wln
+                            } else {
+                                q = q + 1
+                            }
+                        }
+                        if ok2 {
+                            wpos = s2
+                            s2 = lim
+                        } else {
+                            s2 = s2 + 1
+                        }
+                    }
+                }
+            }
+            if wpos >= tn {
+                scanning = false
+            } else {
+                let pathStart = wpos + wln
+                let mut pe = pathStart
+                let mut findNl = true
+                while findNl {
+                    if pe >= tn {
+                        findNl = false
+                    } else {
+                        if outbuf[pe] == 10_u8 {
+                            findNl = false
+                        } else {
+                            pe = pe + 1
+                        }
+                    }
+                }
+                let contentStart = pe + 1
+                // find "\n@@END" from contentStart
+                let mut cend = tn
+                if contentStart < tn {
+                    if eln <= tn {
+                        let mut s3 = contentStart
+                        let lim2 = (tn - eln) + 1
+                        let mut sd = true
+                        while sd {
+                            if s3 >= lim2 {
+                                sd = false
+                            } else {
+                                let mut r: usize = 0
+                                let mut ok3 = true
+                                while r < eln {
+                                    if outbuf[s3 + r] != emk[r] {
+                                        ok3 = false
+                                        r = eln
+                                    } else {
+                                        r = r + 1
+                                    }
+                                }
+                                if ok3 {
+                                    cend = s3
+                                    sd = false
+                                } else {
+                                    s3 = s3 + 1
+                                }
+                            }
+                        }
+                    }
+                }
+                let pathSpan: Span<u8> = outbuf[pathStart..pe]
+                let contentSpan: Span<u8> = outbuf[contentStart..cend]
+
+                // match path against a provided workspace arg
+                let mut mi = firstFileArg
+                let mut matched = false
+                while mi < argc {
+                    let mam = std.args.get(mi)
+                    if mam.has {
+                        if std.mem.eqlBytes(std.mem.span(mam.value), pathSpan) {
+                            let res = std.fs.writeBytes(mam.value, contentSpan)
+                            if res.has {
+                                wrote = wrote + 1
+                                check world.out.write("zcc: wrote ")
+                                check world.out.write(mam.value)
+                                check world.out.write("\n")
+                            } else {
+                                check world.err.write("zcc: failed to write ")
+                                check world.err.write(mam.value)
+                                check world.err.write("\n")
+                            }
+                            matched = true
+                            mi = argc
+                        } else {
+                            mi = mi + 1
+                        }
+                    } else {
+                        mi = mi + 1
+                    }
+                }
+                if matched == false {
+                    check world.err.write("zcc: model named a path not in the workspace args; ignored\n")
+                }
+                scan = cend + 1
+            }
+        }
+    }
+
+    if wrote == 0 {
+        check world.out.write("zcc: no files changed\n")
+    }
+}
